@@ -60,7 +60,7 @@ const isFeatureRerunTrigger = (trigger: WatchTrigger): boolean =>
  *
  * @internal
  */
-export const mergePlan = (accumulator: WatchRunPlan, trigger: WatchTrigger): WatchRunPlan =>
+const mergePlan = (accumulator: WatchRunPlan, trigger: WatchTrigger): WatchRunPlan =>
   isFeatureRerunTrigger(trigger)
     ? { full: accumulator.full, features: Arr.append(accumulator.features, trigger.path) }
     : { full: true, features: [] };
@@ -71,7 +71,7 @@ export const mergePlan = (accumulator: WatchRunPlan, trigger: WatchTrigger): Wat
  *
  * @internal
  */
-export const finalizePlan = (
+const finalizePlan = (
   plan: WatchRunPlan,
   featurePatterns: ReadonlyArray<string>,
 ): WatchRunPlan => ({

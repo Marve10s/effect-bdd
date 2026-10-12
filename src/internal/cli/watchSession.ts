@@ -33,8 +33,12 @@ export interface WatchSessionOptions {
   };
 }
 
-/** @internal */
-export interface RunOutcome {
+/**
+ * The exit status of one child CLI run.
+ *
+ * @internal
+ */
+interface RunOutcome {
   readonly failed: boolean;
 }
 
@@ -106,7 +110,7 @@ export const replaceFlagValues =
  *
  * @internal
  */
-export const runChildOnce: (
+const runChildOnce: (
   session: WatchSessionOptions,
   plan: Watch.WatchRunPlan,
 ) => Effect.Effect<RunOutcome, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> = (
