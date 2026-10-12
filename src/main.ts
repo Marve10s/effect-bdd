@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fn from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as CliError from "effect/cli/CliError";
 import * as Command from "effect/cli/Command";
 import * as Flag from "effect/cli/Flag";
@@ -21,6 +22,7 @@ import {
 import { ModuleLoader } from "./internal/cli/moduleLoader.ts";
 import * as Reporter from "./internal/cli/reporter.ts";
 import * as Runner from "./internal/cli/runner.ts";
+import * as WatchSession from "./internal/cli/watchSession.ts";
 import * as CucumberCompiler from "./internal/cucumberCompiler.ts";
 
 const features = Flag.String("features").pipe(
@@ -150,6 +152,13 @@ const strict = Flag.Boolean("strict").pipe(
   Flag.withDefault(false),
 );
 
+const watch = Flag.Boolean("watch").pipe(
+  Flag.withDescription(
+    "Watch feature and step files, rerunning on change. Reapplies --tags and --title on every run.",
+  ),
+  Flag.withDefault(false),
+);
+
 /** @internal */
 export const cli = Command.make(
   "effect-bdd",
@@ -169,9 +178,17 @@ export const cli = Command.make(
     title,
     failFast,
     strict,
+    watch,
   },
   Effect.fnUntraced(function* (args) {
     const options = cliOptions(args);
+    if (args.watch) {
+      yield* WatchSession.watchSession({
+        cli: options,
+        invocation: WatchSession.childInvocation(yield* processArgv),
+      }).pipe(Effect.mapError(toUserError));
+      return;
+    }
     const reporters = yield* Reporter.makeReporters(options.reporters, options.outputFiles, {
       verbose: options.verbose,
     }).pipe(Effect.mapError(toUserError));
@@ -193,7 +210,12 @@ export const cli = Command.make(
 ).pipe(
   Command.withDescription("Run effect-bdd feature files"),
   Command.provide(
-    Layer.mergeAll(GlobResolver.layer, ModuleLoader.layer, CucumberCompiler.layerCucumber),
+    Layer.mergeAll(
+      GlobResolver.layer,
+      ModuleLoader.layer,
+      CucumberCompiler.layerCucumber,
+      Path.layer,
+    ),
   ),
 );
 
@@ -204,6 +226,8 @@ export const run = Command.run(cli, {
 
 const toUserError = (error: { readonly message: string }): CliError.UserError =>
   new CliError.UserError({ cause: error.message });
+
+const processArgv: Effect.Effect<ReadonlyArray<string>> = Effect.sync(() => process.argv);
 
 const timedMillis: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<number, E, R> =
   Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
@@ -238,6 +262,7 @@ interface CliArgs {
   readonly title: ReadonlyArray<string>;
   readonly failFast: boolean;
   readonly strict: boolean;
+  readonly watch: boolean;
 }
 
 const cliOptions = (args: CliArgs): CliOptions => ({
