@@ -2,6 +2,7 @@ import { NodeServices } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -27,11 +28,17 @@ import {
 } from "../src/internal/cli/watch.ts";
 import {
   childInvocation,
-  childRunArgv,
-  replaceFlagValues,
   type WatchSessionOptions,
   watchLoop,
 } from "../src/internal/cli/watchSession.ts";
+import {
+  applyFeatureNarrowing,
+  isWatchChildEnv,
+  narrowEnvName,
+  narrowEnvValue,
+  narrowFromEnv,
+  watchChildEnvName,
+} from "../src/internal/cli/watchNarrowing.ts";
 
 const update = (path: string): WatchTrigger => ({ _tag: "Update", path });
 const remove = (path: string): WatchTrigger => ({ _tag: "Remove", path });
@@ -144,88 +151,84 @@ describe("glob matcher", () => {
   });
 });
 
-describe("child argv assembly", () => {
-  const session: Parameters<typeof childRunArgv>[0] = {
-    cli: {
-      features: ["features/*.feature"],
-      steps: ["steps/*.ts"],
-      reporters: ["text"],
-      outputFiles: {},
-      verbose: false,
-      strict: false,
-      filters: { tags: ["@smoke"], titles: ["login"], failFast: false },
-      parallel: 1,
-    },
-    invocation: {
-      executable: "node",
-      script: "bin.ts",
-      args: [
-        "--features",
-        "features/*.feature",
-        "--steps",
-        "steps/*.ts",
-        "--tags",
-        "@smoke",
-        "--title",
-        "login",
-      ],
-    },
-  };
-
-  it("replaces --features values for a narrowed plan", () => {
-    const argv = childRunArgv(session, { full: false, features: ["features/login.feature"] });
-    assert.deepStrictEqual(argv, [
-      "--features",
-      "features/login.feature",
-      "--steps",
-      "steps/*.ts",
-      "--tags",
-      "@smoke",
-      "--title",
-      "login",
-    ]);
-  });
-
-  it("uses the original patterns for a full plan", () => {
-    const argv = childRunArgv(session, { full: true, features: ["features/*.feature"] });
-    assert.deepStrictEqual(argv, session.invocation.args);
-  });
-
-  it("strips --watch from the child invocation", () => {
-    assert.deepStrictEqual(childInvocation(["node", "bin.ts", "--watch", "--tags", "@smoke"]), {
-      executable: "node",
-      script: "bin.ts",
-      args: ["--tags", "@smoke"],
-    });
-  });
-
-  it("falls back to the running interpreter when argv is empty", () => {
-    const invocation = childInvocation([]);
-    assert.strictEqual(invocation.executable, process.execPath);
-    assert.strictEqual(invocation.script, "");
-  });
-
-  it("replaces flag values in the middle of argv", () => {
+describe("child invocation", () => {
+  it("strips --watch from the child invocation and keeps exec argv", () => {
     assert.deepStrictEqual(
-      replaceFlagValues("--tags", ["@nightly"])([
-        "--features",
-        "a",
-        "--tags",
-        "@smoke",
-        "--parallel",
-        "2",
-      ]),
-      ["--features", "a", "--tags", "@nightly", "--parallel", "2"],
+      childInvocation(["node", "bin.ts", "--watch", "--tags", "@smoke"], ["--import", "tsx"]),
+      {
+        executable: "node",
+        execArgv: ["--import", "tsx"],
+        script: "bin.ts",
+        args: ["--tags", "@smoke"],
+      },
     );
   });
 
-  it("appends the flag when absent", () => {
-    assert.deepStrictEqual(replaceFlagValues("--tags", ["@nightly"])(["--features", "a"]), [
-      "--features",
-      "a",
-      "--tags",
-      "@nightly",
-    ]);
+  it("strips --watch=value spellings, not just the bare flag", () => {
+    const invocation = childInvocation(["node", "bin.ts", "--watch=true"], []);
+    assert.deepStrictEqual(invocation.args, []);
+  });
+
+  it("keeps similarly named user flags", () => {
+    const invocation = childInvocation(["node", "bin.ts", "--watchdog", "true"], []);
+    assert.deepStrictEqual(invocation.args, ["--watchdog", "true"]);
+  });
+
+  it("falls back to the running interpreter when argv is empty", () => {
+    const invocation = childInvocation([], []);
+    assert.strictEqual(invocation.executable, process.execPath);
+    assert.strictEqual(invocation.script, "");
+  });
+});
+
+describe("watch narrowing environment", () => {
+  it.effect("preserves feature paths containing colons", () =>
+    Effect.gen(function* () {
+      const features = ["a:one.feature", "b/two.feature"];
+      const encoded = yield* narrowEnvValue(features);
+      assert.strictEqual(encoded, '["a:one.feature","b/two.feature"]');
+      assert.deepStrictEqual(narrowFromEnv({ [narrowEnvName]: encoded }), Option.some(features));
+    }),
+  );
+
+  it("reads a narrowed feature list back from the environment", () => {
+    assert.deepStrictEqual(
+      narrowFromEnv({ [narrowEnvName]: '["a/b.feature","c/d.feature"]' }),
+      Option.some(["a/b.feature", "c/d.feature"]),
+    );
+  });
+
+  it("returns None when the narrowing variable is absent", () => {
+    assert.deepStrictEqual(narrowFromEnv({}), Option.none());
+  });
+
+  it("returns an empty list when the narrowing variable is empty", () => {
+    assert.deepStrictEqual(narrowFromEnv({ [narrowEnvName]: "[]" }), Option.some([]));
+  });
+
+  it("returns None for malformed narrowing JSON", () => {
+    assert.deepStrictEqual(narrowFromEnv({ [narrowEnvName]: "not-json" }), Option.none());
+  });
+
+  it("applies narrowing only to marked watch children", () => {
+    const options = { features: ["features/*.feature"], parallel: 2 };
+    const env = {
+      [watchChildEnvName]: "1",
+      [narrowEnvName]: '["features/login.feature"]',
+    };
+    assert.deepStrictEqual(applyFeatureNarrowing(options, env), {
+      ...options,
+      features: ["features/login.feature"],
+    });
+    assert.strictEqual(
+      applyFeatureNarrowing(options, { [narrowEnvName]: env[narrowEnvName] }),
+      options,
+    );
+  });
+
+  it("detects a watch child by its marker variable", () => {
+    assert.strictEqual(isWatchChildEnv({ [watchChildEnvName]: "1" }), true);
+    assert.strictEqual(isWatchChildEnv({}), false);
   });
 });
 
@@ -276,17 +279,22 @@ describe("watchLoop", () => {
     all: Stream.empty,
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
-    unref: Effect.void,
-    reref: Effect.void,
+    unref: Effect.succeed(Effect.void),
   });
 
-  const recordingSpawner = (commands: Ref.Ref<Array<ReadonlyArray<string>>>) =>
+  const recordingSpawner = (
+    commands: Ref.Ref<Array<ReadonlyArray<string>>>,
+    envs: Ref.Ref<Array<Record<string, string | undefined>>>,
+  ) =>
     ChildProcessSpawner.make((command) => {
       if (command._tag !== "StandardCommand") {
         return Effect.die("unexpected command form");
       }
       return Effect.as(
-        Ref.update(commands, (recorded) => [...recorded, command.args]),
+        Effect.all([
+          Ref.update(commands, (recorded) => [...recorded, command.args]),
+          Ref.update(envs, (recorded) => [...recorded, command.options.env ?? {}]),
+        ]),
         stubHandle,
       );
     });
@@ -294,45 +302,96 @@ describe("watchLoop", () => {
   it.live(
     "runs the initial full run, then one run per poll batch",
     () =>
+      // This live fiber test intentionally coordinates setup, a poll delay, and
+      // assertions over the captured process boundary.
+      // oxlint-disable-next-line complexity
       Effect.gen(function* () {
         const commands = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
+        const envs = yield* Ref.make<Array<Record<string, string | undefined>>>([]);
         const session: WatchSessionOptions = {
           cli: {
             features: ["features/*.feature"],
-            steps: [],
+            steps: ["steps/*.ts"],
             reporters: ["text"],
             outputFiles: {},
             verbose: false,
             strict: false,
-            filters: { tags: [], titles: [], failFast: false },
+            filters: { tags: ["@smoke"], titles: ["login"], failFast: false },
             parallel: 1,
           },
-          invocation: {
-            executable: "node",
-            script: "bin.ts",
-            args: ["--features", "features/*.feature"],
-          },
+          invocation: childInvocation(
+            [
+              "node",
+              "bin.ts",
+              "-f",
+              "features/*.feature",
+              "-s",
+              "steps/*.ts",
+              "--tags",
+              "@smoke",
+              "--title",
+              "login",
+              "--watch",
+            ],
+            ["--import", "tsx"],
+          ),
         };
         const triggers = yield* makeTriggerQueue;
         yield* Queue.offer(triggers, [update("a/one.feature")]);
-        yield* Queue.offer(triggers, [update("steps/x.step.ts")]);
         yield* Effect.forkScoped(
           watchLoop(session, triggers).pipe(
             Effect.provide(
-              Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, recordingSpawner(commands)),
+              Layer.succeed(
+                ChildProcessSpawner.ChildProcessSpawner,
+                recordingSpawner(commands, envs),
+              ),
             ),
           ),
         );
         // Wait for the initial run plus at least one poll tick, then stop.
         yield* Effect.sleep("600 millis");
         const recorded = yield* Ref.get(commands);
-        // The interpreter and script lead every invocation; the poll drains both
-        // batches at once, so the narrowed feature run and the widened step run
-        // collapse into a single full rerun after the initial run.
+        const recordedEnvs = yield* Ref.get(envs);
+        // The interpreter's exec argv precedes the script in every invocation;
+        // argv is otherwise left intact, including the -f/-s aliases and filters.
+        // A feature-only batch passes its narrowed paths through the environment,
+        // leaving the user's original --features glob unchanged.
         assert.deepStrictEqual(recorded, [
-          ["bin.ts", "--features", "features/*.feature"],
-          ["bin.ts", "--features", "features/*.feature"],
+          [
+            "--import",
+            "tsx",
+            "bin.ts",
+            "-f",
+            "features/*.feature",
+            "-s",
+            "steps/*.ts",
+            "--tags",
+            "@smoke",
+            "--title",
+            "login",
+          ],
+          [
+            "--import",
+            "tsx",
+            "bin.ts",
+            "-f",
+            "features/*.feature",
+            "-s",
+            "steps/*.ts",
+            "--tags",
+            "@smoke",
+            "--title",
+            "login",
+          ],
         ]);
+        assert.strictEqual(isWatchChildEnv(recordedEnvs[0] ?? {}), true);
+        assert.deepStrictEqual(narrowFromEnv(recordedEnvs[0] ?? {}), Option.none());
+        assert.strictEqual((recordedEnvs[0] ?? {})[narrowEnvName], undefined);
+        assert.strictEqual(isWatchChildEnv(recordedEnvs[1] ?? {}), true);
+        assert.deepStrictEqual(
+          narrowFromEnv(recordedEnvs[1] ?? {}),
+          Option.some(["a/one.feature"]),
+        );
       }),
     15000,
   );
@@ -340,7 +399,7 @@ describe("watchLoop", () => {
 
 describe("watch session end to end", () => {
   it.live(
-    "reruns through the real CLI when a feature file changes",
+    "reruns only the changed feature through the real CLI and refreshes step modules",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -353,45 +412,75 @@ describe("watch session end to end", () => {
             prefix: ".effect-bdd-watch-",
           });
           const featurePath = path.join(directory, "counter.feature");
-          const stepsPath = path.join(directory, "steps.mjs");
+          const otherFeaturePath = path.join(directory, "other.feature");
+          const stepsPath = path.join(directory, "steps.ts");
           const textReport = path.join(directory, "watch-report.txt");
-          const writeFeature = (name: string) =>
+          const writeFeature = (name: string, expected = 1) =>
             fs.writeFileString(
               featurePath,
-              `Feature: Counter\n\n  Scenario: ${name}\n    When increment\n    Then the counter is 1\n`,
+              `Feature: Counter\n\n  Scenario: ${name}\n    When increment\n    Then the counter is ${expected}\n`,
+            );
+          const writeOtherFeature = () =>
+            fs.writeFileString(
+              otherFeaturePath,
+              "Feature: Other\n\n  Scenario: Untouched\n    When increment\n    Then the counter is 1\n",
             );
           const writeSteps = (name: string) => fs.writeFileString(stepsPath, watchSteps(name));
 
-          yield* Effect.all([writeFeature("Increment"), writeSteps("Increment")]);
+          yield* Effect.all([
+            writeFeature("Increment"),
+            writeOtherFeature(),
+            writeSteps("Increment"),
+          ]);
 
           const binPath = path.join(testDir, "..", "src", "bin.ts");
+          const inheritedNarrowing = yield* narrowEnvValue([featurePath]);
           const handle = yield* spawner.spawn(
-            ChildProcess.make(process.execPath, [
-              binPath,
-              "--features",
-              path.join(directory, "*.feature"),
-              "--steps",
-              stepsPath,
-              "--reporter",
-              "text",
-              "--output-file.text",
-              textReport,
-              "--verbose",
-              "--watch",
-            ]),
+            ChildProcess.make(
+              process.execPath,
+              [
+                "--experimental-strip-types",
+                binPath,
+                "-f",
+                path.join(directory, "*.feature"),
+                "-s",
+                stepsPath,
+                "--reporter",
+                "text",
+                "--output-file.text",
+                textReport,
+                "--verbose",
+                "--watch",
+              ],
+              {
+                env: { [narrowEnvName]: inheritedNarrowing },
+                extendEnv: true,
+              },
+            ),
           );
 
-          // Initial run writes the report; wait for it before editing. The
-          // report lists scenarios as "Feature / Scenario", which only appears
-          // with --verbose scenario lines.
+          // Initial run writes a report containing both features. The report
+          // lists selected scenarios with --verbose.
           yield* waitForReport(textReport, "Counter / Increment");
+          yield* waitForReport(textReport, "Other / Untouched");
 
-          // Rename the scenario in the feature and its matching step chain; the
-          // watch should rerun (the steps change widens it to a full run) and
-          // the report should pick up the new title.
+          // Editing only the counter feature should rerun only that file. This
+          // checks the parent-to-child environment handoff actually changes
+          // Runner.run's --features input; the untouched feature must be absent
+          // from the rewritten report.
+          yield* Effect.sleep("400 millis");
+          yield* writeFeature("Increment", 2);
+          yield* waitForReport(textReport, "Features: 1, Scenarios: 1, passed: 0, failed: 1");
+          const narrowedReport = yield* fs.readFileString(textReport);
+          assert.strictEqual(narrowedReport.includes("Other / Untouched"), false);
+
+          // Now edit the feature and step module together. A step change widens
+          // the run, and the new chain title must be loaded by a fresh child
+          // process. The Node type-stripping flag must also reach that child.
           yield* Effect.sleep("400 millis");
           yield* Effect.all([writeFeature("Renamed"), writeSteps("Renamed")]);
           yield* waitForReport(textReport, "Counter / Renamed");
+          yield* waitForReport(textReport, "Other / Untouched");
 
           yield* handle.kill();
         }),
@@ -431,5 +520,9 @@ const thenCounterIs = Bdd.then\`the counter is \${expected}\`(({ expected }, sta
 
 export const counter = Bdd.feature("Counter").pipe(
   Bdd.scenario("${scenarioName}").pipe(whenIncrement, thenCounterIs),
+);
+
+export const other = Bdd.feature("Other").pipe(
+  Bdd.scenario("Untouched").pipe(whenIncrement, thenCounterIs),
 );
 `;

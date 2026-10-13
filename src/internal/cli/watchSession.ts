@@ -1,26 +1,33 @@
 import * as Arr from "effect/Array";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Fn from "effect/Function";
-import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Str from "effect/String";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import type { PlatformError } from "effect/PlatformError";
 import type { CliOptions } from "./models.ts";
+import {
+  narrowEnvName,
+  narrowEnvValue,
+  watchChildEnvName,
+  watchChildEnvValue,
+} from "./watchNarrowing.ts";
 import * as Watch from "./watch.ts";
 
 /** @internal */
-export type WatchSessionError = PlatformError;
+export type WatchSessionError = PlatformError | Schema.SchemaError;
 
 /**
  * Everything the watch session needs that does not change between reruns:
- * the parsed CLI options, and the child process invocation (interpreter, script
- * path, and the user's flags with `--watch` removed).
+ * the parsed CLI options, and the child process invocation (interpreter, its
+ * exec arguments, the script path, and the user's flags with `--watch`
+ * removed).
  *
  * @internal
  */
@@ -28,6 +35,7 @@ export interface WatchSessionOptions {
   readonly cli: CliOptions;
   readonly invocation: {
     readonly executable: string;
+    readonly execArgv: ReadonlyArray<string>;
     readonly script: string;
     readonly args: ReadonlyArray<string>;
   };
@@ -43,70 +51,37 @@ interface RunOutcome {
 }
 
 /**
- * Build the child process invocation from the raw process argv: the
- * interpreter, the script path, and the user's flags with `--watch` removed so
- * a child process does not start its own watcher.
+ * Build the child process invocation from the raw process argv and exec argv:
+ * the interpreter, the interpreter's own options (`--import tsx` and friends,
+ * which must reach the child or TypeScript step modules will not load), the
+ * script path, and the user's flags with any `--watch` spelling removed so a
+ * child process does not start its own watcher.
  *
  * @internal
  */
-export const childInvocation = (argv: ReadonlyArray<string>): WatchSessionOptions["invocation"] => {
+export const childInvocation = (
+  argv: ReadonlyArray<string>,
+  execArgv: ReadonlyArray<string>,
+): WatchSessionOptions["invocation"] => {
   const [executable, script, ...flags] = argv;
   return {
     executable: executable ?? process.execPath,
+    execArgv,
     script: script ?? "",
-    args: Arr.filter(flags, (token) => token !== "--watch"),
+    args: Arr.filter(flags, (token) => !isWatchFlag(token)),
   };
 };
 
-/**
- * The flag arguments for one child CLI run. A narrowed plan replaces the
- * `--features` values with the changed feature files; every other flag
- * forwards unchanged, so tag/title filters, reporters, and timeouts behave
- * identically to a normal run.
- *
- * @internal
- */
-export const childRunArgv = (
-  session: WatchSessionOptions,
-  plan: Watch.WatchRunPlan,
-): ReadonlyArray<string> => replaceFlagValues("--features", plan.features)(session.invocation.args);
-
-/**
- * Replace the values of an existing repeated flag in an argv, or append the
- * flag when it is absent.
- *
- * @internal
- */
-export const replaceFlagValues =
-  (
-    flag: string,
-    values: ReadonlyArray<string>,
-  ): ((argv: ReadonlyArray<string>) => ReadonlyArray<string>) =>
-  (argv) => {
-    const flagIndex = Fn.pipe(
-      argv,
-      Arr.findFirstIndex((token) => token === flag),
-    );
-    if (Option.isNone(flagIndex)) {
-      return Arr.appendAll(argv, Watch.repeatFlag(flag, values));
-    }
-    const nextFlagIndex = Fn.pipe(
-      argv,
-      Arr.findFirstIndex(
-        (token, index) => index > flagIndex.value && Fn.pipe(token, Str.startsWith("--")),
-      ),
-    );
-    const before = Fn.pipe(argv, Arr.splitAt(flagIndex.value + 1))[0];
-    const after = Option.match(nextFlagIndex, {
-      onNone: (): ReadonlyArray<string> => [],
-      onSome: (index) => Fn.pipe(argv, Arr.splitAt(index))[1],
-    });
-    return Arr.appendAll(Arr.appendAll(before, values), after);
-  };
+const isWatchFlag = (token: string): boolean =>
+  token === "--watch" || Fn.pipe(token, Str.startsWith("--watch="));
 
 /**
  * Execute one child CLI run with inherited stdio, so reports stream to the
- * user's terminal as they are produced.
+ * user's terminal as they are produced. The child's argv is always the user's
+ * original flags; a narrowed plan is passed through the environment instead,
+ * so aliases, repeated flags, and interpreter options cannot be mangled. The
+ * child is also marked as a watch child so it never starts its own watcher,
+ * whatever argv spelling reached it.
  *
  * @internal
  */
@@ -119,9 +94,16 @@ const runChildOnce: (
 ) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const { executable, script } = session.invocation;
+    const { executable, execArgv, script } = session.invocation;
+    const narrowFeatures = plan.full ? undefined : yield* narrowEnvValue(plan.features);
+    const env = {
+      [watchChildEnvName]: watchChildEnvValue,
+      [narrowEnvName]: narrowFeatures,
+    };
     const exitCode = yield* spawner.exitCode(
-      ChildProcess.make(executable, [script, ...childRunArgv(session, plan)], {
+      ChildProcess.make(executable, [...execArgv, script, ...session.invocation.args], {
+        env,
+        extendEnv: true,
         stdout: "inherit",
         stderr: "inherit",
       }),

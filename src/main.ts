@@ -1,6 +1,8 @@
 /** @internal */
 import * as Arr from "effect/Array";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +22,12 @@ import {
   type ReporterName,
 } from "./internal/cli/models.ts";
 import { ModuleLoader } from "./internal/cli/moduleLoader.ts";
+import {
+  applyFeatureNarrowing,
+  isWatchChildEnv,
+  narrowEnvName,
+  watchChildEnvName,
+} from "./internal/cli/watchNarrowing.ts";
 import * as Reporter from "./internal/cli/reporter.ts";
 import * as Runner from "./internal/cli/runner.ts";
 import * as WatchSession from "./internal/cli/watchSession.ts";
@@ -181,11 +189,14 @@ export const cli = Command.make(
     watch,
   },
   Effect.fnUntraced(function* (args) {
-    const options = cliOptions(args);
-    if (args.watch) {
+    const watchEnvironment = yield* readWatchEnvironment;
+    const options = applyFeatureNarrowing(cliOptions(args), watchEnvironment);
+    // A watch child (spawned by a running watch session) reruns and exits; it
+    // never starts its own watcher, whatever `--watch` spelling reached it.
+    if (args.watch && !isWatchChildEnv(watchEnvironment)) {
       yield* WatchSession.watchSession({
         cli: options,
-        invocation: WatchSession.childInvocation(yield* processArgv),
+        invocation: WatchSession.childInvocation(yield* processArgv, process.execArgv),
       }).pipe(Effect.mapError(toUserError));
       return;
     }
@@ -228,6 +239,20 @@ const toUserError = (error: { readonly message: string }): CliError.UserError =>
   new CliError.UserError({ cause: error.message });
 
 const processArgv: Effect.Effect<ReadonlyArray<string>> = Effect.sync(() => process.argv);
+
+const watchEnvironmentConfig = Config.all({
+  watchChild: Config.option(Config.String(watchChildEnvName)),
+  narrowedFeatures: Config.option(Config.String(narrowEnvName)),
+});
+
+const readWatchEnvironment = Effect.gen(function* () {
+  const provider = yield* ConfigProvider.ConfigProvider;
+  const configured = yield* watchEnvironmentConfig.parse(provider);
+  return {
+    [watchChildEnvName]: Option.getOrUndefined(configured.watchChild),
+    [narrowEnvName]: Option.getOrUndefined(configured.narrowedFeatures),
+  };
+});
 
 const timedMillis: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<number, E, R> =
   Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
@@ -289,7 +314,6 @@ const cliOptions = (args: CliArgs): CliOptions => ({
 
 const defaultReporters = (reporters: ReadonlyArray<ReporterName>): ReadonlyArray<ReporterName> =>
   reporters.length === 0 ? ["text"] : reporters;
-
 const textOutputFile = (
   file: Option.Option<string>,
 ): Pick<CliOptions["outputFiles"], "text"> | {} =>
