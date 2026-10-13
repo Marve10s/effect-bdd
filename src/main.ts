@@ -1,12 +1,15 @@
 /** @internal */
 import * as Arr from "effect/Array";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
 import * as Fn from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as CliError from "effect/cli/CliError";
 import * as Command from "effect/cli/Command";
 import * as Flag from "effect/cli/Flag";
@@ -19,8 +22,15 @@ import {
   type ReporterName,
 } from "./internal/cli/models.ts";
 import { ModuleLoader } from "./internal/cli/moduleLoader.ts";
+import {
+  applyFeatureNarrowing,
+  isWatchChildEnv,
+  narrowEnvName,
+  watchChildEnvName,
+} from "./internal/cli/watchNarrowing.ts";
 import * as Reporter from "./internal/cli/reporter.ts";
 import * as Runner from "./internal/cli/runner.ts";
+import * as WatchSession from "./internal/cli/watchSession.ts";
 import * as CucumberCompiler from "./internal/cucumberCompiler.ts";
 
 const features = Flag.String("features").pipe(
@@ -150,6 +160,13 @@ const strict = Flag.Boolean("strict").pipe(
   Flag.withDefault(false),
 );
 
+const watch = Flag.Boolean("watch").pipe(
+  Flag.withDescription(
+    "Watch feature and step files, rerunning on change. Reapplies --tags and --title on every run.",
+  ),
+  Flag.withDefault(false),
+);
+
 /** @internal */
 export const cli = Command.make(
   "effect-bdd",
@@ -169,9 +186,20 @@ export const cli = Command.make(
     title,
     failFast,
     strict,
+    watch,
   },
   Effect.fnUntraced(function* (args) {
-    const options = cliOptions(args);
+    const watchEnvironment = yield* readWatchEnvironment;
+    const options = applyFeatureNarrowing(cliOptions(args), watchEnvironment);
+    // A watch child (spawned by a running watch session) reruns and exits; it
+    // never starts its own watcher, whatever `--watch` spelling reached it.
+    if (args.watch && !isWatchChildEnv(watchEnvironment)) {
+      yield* WatchSession.watchSession({
+        cli: options,
+        invocation: WatchSession.childInvocation(yield* processArgv, process.execArgv),
+      }).pipe(Effect.mapError(toUserError));
+      return;
+    }
     const reporters = yield* Reporter.makeReporters(options.reporters, options.outputFiles, {
       verbose: options.verbose,
     }).pipe(Effect.mapError(toUserError));
@@ -193,7 +221,12 @@ export const cli = Command.make(
 ).pipe(
   Command.withDescription("Run effect-bdd feature files"),
   Command.provide(
-    Layer.mergeAll(GlobResolver.layer, ModuleLoader.layer, CucumberCompiler.layerCucumber),
+    Layer.mergeAll(
+      GlobResolver.layer,
+      ModuleLoader.layer,
+      CucumberCompiler.layerCucumber,
+      Path.layer,
+    ),
   ),
 );
 
@@ -205,6 +238,22 @@ export const run = Command.run(cli, {
 const toUserError = (error: { readonly message: string }): CliError.UserError =>
   new CliError.UserError({ cause: error.message });
 
+const processArgv: Effect.Effect<ReadonlyArray<string>> = Effect.sync(() => process.argv);
+
+const watchEnvironmentConfig = Config.all({
+  watchChild: Config.option(Config.String(watchChildEnvName)),
+  narrowedFeatures: Config.option(Config.String(narrowEnvName)),
+});
+
+const readWatchEnvironment = Effect.gen(function* () {
+  const provider = yield* ConfigProvider.ConfigProvider;
+  const configured = yield* watchEnvironmentConfig.parse(provider);
+  return {
+    [watchChildEnvName]: Option.getOrUndefined(configured.watchChild),
+    [narrowEnvName]: Option.getOrUndefined(configured.narrowedFeatures),
+  };
+});
+
 const timedMillis: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<number, E, R> =
   Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
     const startedAt = yield* Clock.currentTimeMillis;
@@ -213,14 +262,16 @@ const timedMillis: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<nu
     return finishedAt - startedAt;
   });
 
-const emitBenchmarkTiming = (outputFile: string | undefined, reportEmissionMillis: number) => {
+const emitBenchmarkTiming = Effect.fnUntraced(function* (
+  outputFile: string | undefined,
+  reportEmissionMillis: number,
+) {
   if (outputFile === undefined) {
-    return Effect.void;
+    return;
   }
-  return Effect.flatMap(FileSystem.FileSystem, (fs) =>
-    fs.writeFileString(outputFile, `${reportEmissionMillis}\n`),
-  );
-};
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs.writeFileString(outputFile, `${reportEmissionMillis}\n`);
+});
 
 interface CliArgs {
   readonly features: ReadonlyArray<string>;
@@ -238,6 +289,7 @@ interface CliArgs {
   readonly title: ReadonlyArray<string>;
   readonly failFast: boolean;
   readonly strict: boolean;
+  readonly watch: boolean;
 }
 
 const cliOptions = (args: CliArgs): CliOptions => ({
@@ -264,7 +316,6 @@ const cliOptions = (args: CliArgs): CliOptions => ({
 
 const defaultReporters = (reporters: ReadonlyArray<ReporterName>): ReadonlyArray<ReporterName> =>
   reporters.length === 0 ? ["text"] : reporters;
-
 const textOutputFile = (
   file: Option.Option<string>,
 ): Pick<CliOptions["outputFiles"], "text"> | {} =>
