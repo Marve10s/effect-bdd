@@ -517,14 +517,9 @@ describe("watch session end to end", () => {
   );
 });
 
-const waitForReport = (
-  file: string,
-  contains: string,
-): Effect.Effect<void, Error, FileSystem.FileSystem> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    return yield* fs.readFileString(file);
-  }).pipe(
+const waitForReport = Effect.fnUntraced(function* (file: string, contains: string) {
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs.readFileString(file).pipe(
     Effect.filterOrFail(
       (text) => text.includes(contains),
       () => new Error(`report never contained "${contains}"`),
@@ -533,6 +528,7 @@ const waitForReport = (
     Effect.retry(Schedule.addDelay(Schedule.recurs(75), () => Effect.succeed("200 millis"))),
     Effect.asVoid,
   );
+});
 
 const watchSteps = (scenarioName: string) => `
 import { Bdd } from "effect-bdd";

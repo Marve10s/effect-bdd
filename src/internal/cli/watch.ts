@@ -185,8 +185,9 @@ const hasWildcard = (segment: string): boolean =>
  *
  * @internal
  */
-export const watchRoot: (pattern: string) => Effect.Effect<string, never, Path.Path> = (pattern) =>
-  Effect.map(Path.Path, (path) => {
+export const watchRoot: (pattern: string) => Effect.Effect<string, never, Path.Path> =
+  Effect.fnUntraced(function* (pattern: string) {
+    const path = yield* Path.Path;
     const resolved = path.resolve(pattern);
     const segments = Fn.pipe(
       Str.split(resolved, "/"),
@@ -251,16 +252,17 @@ export const makeTriggerQueue = Queue.sliding<ReadonlyArray<WatchTrigger>>(64);
  *
  * @internal
  */
-export const pumpTriggerQueue: (
+export const pumpTriggerQueue = Effect.fnUntraced(function* (
   events: Stream.Stream<WatchTrigger>,
   queue: Queue.Enqueue<ReadonlyArray<WatchTrigger>>,
-) => Effect.Effect<void, never, never> = (events, queue) =>
-  Stream.runDrain(
+): Effect.fn.Return<void, never, never> {
+  yield* Stream.runDrain(
     Fn.pipe(
       events,
       Stream.mapEffect((trigger) => Effect.asVoid(Queue.offer(queue, [trigger]))),
     ),
   );
+});
 
 /**
  * Take one batch from the queue and fold in any batches that arrived while
@@ -268,10 +270,12 @@ export const pumpTriggerQueue: (
  *
  * @internal
  */
-export const takePendingTriggers: (
+export const takePendingTriggers = Effect.fnUntraced(function* (
   queue: Queue.Dequeue<ReadonlyArray<WatchTrigger>>,
-) => Effect.Effect<ReadonlyArray<WatchTrigger>> = (queue) =>
-  Effect.map(Queue.takeAll(queue), (batches) => Arr.flatten(batches));
+) {
+  const batches = yield* Queue.takeAll(queue);
+  return Arr.flatten(batches);
+});
 
 /**
  * Poll the trigger queue on a schedule, running one rerun per drained batch.
@@ -286,17 +290,22 @@ export const rerunLoop: <E, R>(
   queue: Queue.Dequeue<ReadonlyArray<WatchTrigger>>,
   interval: Schedule.Schedule<unknown, unknown, never, never>,
   onRerun: (triggers: ReadonlyArray<WatchTrigger>) => Effect.Effect<void, E, R>,
-) => Effect.Effect<void, E, R> = (queue, interval, onRerun) =>
-  Stream.runDrain(
+) => Effect.Effect<void, E, R> = Effect.fnUntraced(function* <E, R>(
+  queue: Queue.Dequeue<ReadonlyArray<WatchTrigger>>,
+  interval: Schedule.Schedule<unknown, unknown, never, never>,
+  onRerun: (triggers: ReadonlyArray<WatchTrigger>) => Effect.Effect<void, E, R>,
+): Effect.fn.Return<void, E, R> {
+  yield* Stream.runDrain(
     Stream.mapEffect(Stream.fromSchedule(interval), () =>
       Effect.gen(function* () {
-        const batches = yield* Queue.takeAll(queue);
-        if (batches.length > 0) {
-          yield* onRerun(Arr.flatten(batches));
+        const triggers = yield* takePendingTriggers(queue);
+        if (triggers.length > 0) {
+          yield* onRerun(triggers);
         }
       }),
     ),
   );
+});
 
 /**
  * Render a step timeout for the child CLI's `--step-timeout` flag, which only

@@ -262,14 +262,16 @@ const timedMillis: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<nu
     return finishedAt - startedAt;
   });
 
-const emitBenchmarkTiming = (outputFile: string | undefined, reportEmissionMillis: number) => {
+const emitBenchmarkTiming = Effect.fnUntraced(function* (
+  outputFile: string | undefined,
+  reportEmissionMillis: number,
+) {
   if (outputFile === undefined) {
-    return Effect.void;
+    return;
   }
-  return Effect.flatMap(FileSystem.FileSystem, (fs) =>
-    fs.writeFileString(outputFile, `${reportEmissionMillis}\n`),
-  );
-};
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs.writeFileString(outputFile, `${reportEmissionMillis}\n`);
+});
 
 interface CliArgs {
   readonly features: ReadonlyArray<string>;
