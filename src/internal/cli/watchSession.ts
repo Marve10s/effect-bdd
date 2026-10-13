@@ -108,11 +108,13 @@ const runChildOnce = Effect.fnUntraced(function* (
 export const watchLoop = Effect.fnUntraced(function* (
   session: WatchSessionOptions,
   triggers: Queue.Dequeue<ReadonlyArray<Watch.WatchTrigger>>,
+  patterns: Watch.WatchPatterns,
 ): Effect.fn.Return<void, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> {
+  const classifyTrigger = Watch.makeTriggerClassifier(patterns);
   yield* runChildOnce(session, { full: true, features: session.cli.features });
   yield* Watch.rerunLoop(triggers, Schedule.spaced("100 millis"), (batch) =>
     Effect.gen(function* () {
-      const plan = Watch.planForTriggers(batch, session.cli.features);
+      const plan = Watch.planForTriggers(batch, session.cli.features, classifyTrigger);
       yield* runChildOnce(session, plan);
     }),
   );
@@ -133,7 +135,12 @@ export const watchSession = Effect.fnUntraced(function* (
   WatchSessionError,
   ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path | Scope.Scope
 > {
-  const paths = Watch.watchPaths({ features: session.cli.features, steps: session.cli.steps });
+  const path = yield* Path.Path;
+  const patterns = {
+    features: Arr.map(session.cli.features, (pattern) => path.resolve(pattern)),
+    steps: Arr.map(session.cli.steps, (pattern) => path.resolve(pattern)),
+  };
+  const paths = Watch.watchPaths(patterns);
   const events = yield* Watch.mergedWatchEvents(paths);
   const triggers = yield* Watch.makeTriggerQueue;
   // The pump and the rerun loop are sibling fibers on the session scope:
@@ -142,7 +149,7 @@ export const watchSession = Effect.fnUntraced(function* (
   yield* Effect.all(
     [
       Effect.flatMap(Effect.forkScoped(Watch.pumpTriggerQueue(events, triggers)), Fiber.join),
-      watchLoop(session, triggers),
+      watchLoop(session, triggers, patterns),
     ],
     { concurrency: 2 },
   ).pipe(Effect.asVoid);

@@ -22,14 +22,23 @@ export type WatchTrigger = FileSystemTypes.WatchEvent;
 /**
  * What part of the test surface a watch trigger invalidates.
  *
- * - `features`: a `.feature` file changed, so only that file's scenarios need
- *   to rerun.
- * - `steps`: any other watched file changed. Step definitions may live there,
- *   and they can affect every feature, so the rerun cannot be narrowed.
+ * - `features`: a path matched the configured feature globs, so only that
+ *   feature file's scenarios need to rerun.
+ * - `steps`: a path matched a step glob, or did not match a feature glob. Step
+ *   changes can affect every feature, so the rerun cannot be narrowed.
  *
  * @internal
  */
-export type WatchScope = "features" | "steps";
+type WatchScope = "features" | "steps";
+
+/** @internal */
+export interface WatchPatterns {
+  readonly features: ReadonlyArray<string>;
+  readonly steps: ReadonlyArray<string>;
+}
+
+/** @internal */
+export type TriggerClassifier = (trigger: WatchTrigger) => WatchScope;
 
 /**
  * Which features a watch-mode rerun should execute. When `full` is true the
@@ -44,11 +53,10 @@ export interface WatchRunPlan {
   readonly features: ReadonlyArray<string>;
 }
 
-/** @internal */
-export const classifyTrigger = (trigger: WatchTrigger): WatchScope =>
-  Fn.pipe(trigger.path, Str.endsWith(".feature")) ? "features" : "steps";
-
-const isFeatureRerunTrigger = (trigger: WatchTrigger): boolean =>
+const isFeatureRerunTrigger = (
+  trigger: WatchTrigger,
+  classifyTrigger: TriggerClassifier,
+): boolean =>
   Match.value(trigger).pipe(
     Match.when({ _tag: "Remove" }, () => false),
     Match.orElse((event) => classifyTrigger(event) === "features"),
@@ -60,8 +68,12 @@ const isFeatureRerunTrigger = (trigger: WatchTrigger): boolean =>
  *
  * @internal
  */
-const mergePlan = (accumulator: WatchRunPlan, trigger: WatchTrigger): WatchRunPlan =>
-  isFeatureRerunTrigger(trigger)
+const mergePlan = (
+  accumulator: WatchRunPlan,
+  trigger: WatchTrigger,
+  classifyTrigger: TriggerClassifier,
+): WatchRunPlan =>
+  isFeatureRerunTrigger(trigger, classifyTrigger)
     ? { full: accumulator.full, features: Arr.append(accumulator.features, trigger.path) }
     : { full: true, features: [] };
 
@@ -83,19 +95,23 @@ const finalizePlan = (
 export const planForTriggers = (
   triggers: ReadonlyArray<WatchTrigger>,
   featurePatterns: ReadonlyArray<string>,
-): WatchRunPlan =>
-  finalizePlan(Arr.reduce(triggers, { full: false, features: [] }, mergePlan), featurePatterns);
+  classifyTrigger: TriggerClassifier,
+): WatchRunPlan => {
+  const initialPlan: WatchRunPlan = { full: false, features: [] };
+  const plan = Arr.reduce(triggers, initialPlan, (current, trigger) =>
+    mergePlan(current, trigger, classifyTrigger),
+  );
+  return finalizePlan(plan, featurePatterns);
+};
 
 /**
- * The watched paths for a session: the user's feature and step globs, kept as
- * supplied so events can be matched back against what the user asked to watch.
+ * Flatten feature and step patterns for the watcher. Callers retain the grouped
+ * patterns to classify each event against its source glob.
  *
  * @internal
  */
-export const watchPaths = (options: {
-  readonly features: ReadonlyArray<string>;
-  readonly steps: ReadonlyArray<string>;
-}): ReadonlyArray<string> => Arr.dedupe(Arr.appendAll(options.features, options.steps));
+export const watchPaths = (options: WatchPatterns): ReadonlyArray<string> =>
+  Arr.dedupe(Arr.appendAll(options.features, options.steps));
 
 /**
  * The glob matcher used to decide whether a watched path belongs to a pattern.
@@ -110,6 +126,20 @@ export const globMatcher: (patterns: ReadonlyArray<string>) => (path: string) =>
 ) => {
   const matchers = Arr.map(patterns, compileGlob);
   return (path) => Arr.some(matchers, (matcher) => matcher.test(path));
+};
+
+/**
+ * Compile the configured globs into a classifier. A path matching both groups
+ * is treated as a step change, which conservatively forces a full rerun.
+ * Patterns and event paths must use the same path format.
+ *
+ * @internal
+ */
+export const makeTriggerClassifier = (patterns: WatchPatterns): TriggerClassifier => {
+  const matchesFeature = globMatcher(patterns.features);
+  const matchesStep = globMatcher(patterns.steps);
+  return (trigger) =>
+    matchesFeature(trigger.path) && !matchesStep(trigger.path) ? "features" : "steps";
 };
 
 const compileGlob = (pattern: string): RegExp => {

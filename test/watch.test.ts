@@ -15,13 +15,14 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { fileURLToPath } from "node:url";
 import {
-  classifyTrigger,
   globMatcher,
+  makeTriggerClassifier,
   makeTriggerQueue,
   planForTriggers,
   repeatFlag,
   stepTimeoutArg,
   takePendingTriggers,
+  type WatchPatterns,
   type WatchTrigger,
   watchPaths,
   watchRoot,
@@ -42,57 +43,84 @@ import {
 
 const update = (path: string): WatchTrigger => ({ _tag: "Update", path });
 const remove = (path: string): WatchTrigger => ({ _tag: "Remove", path });
+const testWatchPatterns: WatchPatterns = {
+  features: ["features/**/*.feature"],
+  steps: ["steps/**/*.ts"],
+};
+const classifyTestTrigger = makeTriggerClassifier(testWatchPatterns);
 
 describe("watch trigger classification", () => {
-  it("classifies .feature files as feature triggers", () => {
-    assert.strictEqual(classifyTrigger(update("a/b/login.feature")), "features");
-    assert.strictEqual(classifyTrigger({ _tag: "Create", path: "new.feature" }), "features");
-    assert.strictEqual(classifyTrigger(remove("old.feature")), "features");
+  it("classifies by configured globs rather than file extensions", () => {
+    const classify = makeTriggerClassifier({
+      features: ["specs/**/*.case"],
+      steps: ["steps/**/*.feature"],
+    });
+
+    assert.strictEqual(classify(update("specs/login.case")), "features");
+    assert.strictEqual(classify(update("steps/login.feature")), "steps");
   });
 
-  it("classifies everything else as a step trigger", () => {
-    assert.strictEqual(classifyTrigger(update("steps/login.step.ts")), "steps");
-    assert.strictEqual(classifyTrigger(update("README.md")), "steps");
+  it("treats overlapping feature and step globs as a step change", () => {
+    const classify = makeTriggerClassifier({
+      features: ["shared/**/*.feature"],
+      steps: ["shared/**/*.feature"],
+    });
+
+    assert.strictEqual(classify(update("shared/login.feature")), "steps");
   });
 });
 
 describe("watch run plans", () => {
   it("narrows a feature-only batch to the changed files", () => {
     const plan = planForTriggers(
-      [update("a/one.feature"), update("b/two.feature")],
-      ["features/*.feature"],
+      [update("features/a/one.feature"), update("features/b/two.feature")],
+      testWatchPatterns.features,
+      classifyTestTrigger,
     );
-    assert.deepStrictEqual(plan, { full: false, features: ["a/one.feature", "b/two.feature"] });
+    assert.deepStrictEqual(plan, {
+      full: false,
+      features: ["features/a/one.feature", "features/b/two.feature"],
+    });
   });
 
   it("deduplicates repeated feature triggers", () => {
-    const plan = planForTriggers([update("a/one.feature"), update("a/one.feature")], []);
-    assert.deepStrictEqual(plan, { full: false, features: ["a/one.feature"] });
+    const plan = planForTriggers(
+      [update("features/a/one.feature"), update("features/a/one.feature")],
+      testWatchPatterns.features,
+      classifyTestTrigger,
+    );
+    assert.deepStrictEqual(plan, { full: false, features: ["features/a/one.feature"] });
   });
 
   it("widens to a full rerun when a step file changes", () => {
     const plan = planForTriggers(
-      [update("a/one.feature"), update("steps/login.step.ts")],
-      ["features/*.feature"],
+      [update("features/a/one.feature"), update("steps/login.step.ts")],
+      testWatchPatterns.features,
+      classifyTestTrigger,
     );
-    assert.deepStrictEqual(plan, { full: true, features: ["features/*.feature"] });
+    assert.deepStrictEqual(plan, { full: true, features: testWatchPatterns.features });
   });
 
   it("widens to a full rerun when a feature file is removed", () => {
-    const plan = planForTriggers([remove("a/one.feature")], ["features/*.feature"]);
-    assert.deepStrictEqual(plan, { full: true, features: ["features/*.feature"] });
+    const plan = planForTriggers(
+      [remove("features/a/one.feature")],
+      testWatchPatterns.features,
+      classifyTestTrigger,
+    );
+    assert.deepStrictEqual(plan, { full: true, features: testWatchPatterns.features });
   });
 
   it("treats a feature file creation as a narrowed rerun", () => {
     const plan = planForTriggers(
-      [{ _tag: "Create", path: "a/new.feature" }],
-      ["features/*.feature"],
+      [{ _tag: "Create", path: "features/a/new.feature" }],
+      testWatchPatterns.features,
+      classifyTestTrigger,
     );
-    assert.deepStrictEqual(plan, { full: false, features: ["a/new.feature"] });
+    assert.deepStrictEqual(plan, { full: false, features: ["features/a/new.feature"] });
   });
 
   it("returns an empty plan for an empty batch", () => {
-    assert.deepStrictEqual(planForTriggers([], ["features/*.feature"]), {
+    assert.deepStrictEqual(planForTriggers([], testWatchPatterns.features, classifyTestTrigger), {
       full: false,
       features: [],
     });
@@ -337,9 +365,9 @@ describe("watchLoop", () => {
           ),
         };
         const triggers = yield* makeTriggerQueue;
-        yield* Queue.offer(triggers, [update("a/one.feature")]);
+        yield* Queue.offer(triggers, [update("features/one.feature")]);
         yield* Effect.forkScoped(
-          watchLoop(session, triggers).pipe(
+          watchLoop(session, triggers, testWatchPatterns).pipe(
             Effect.provide(
               Layer.succeed(
                 ChildProcessSpawner.ChildProcessSpawner,
@@ -390,7 +418,7 @@ describe("watchLoop", () => {
         assert.strictEqual(isWatchChildEnv(recordedEnvs[1] ?? {}), true);
         assert.deepStrictEqual(
           narrowFromEnv(recordedEnvs[1] ?? {}),
-          Option.some(["a/one.feature"]),
+          Option.some(["features/one.feature"]),
         );
       }),
     15000,
