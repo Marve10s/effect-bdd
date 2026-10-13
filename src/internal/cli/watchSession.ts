@@ -7,6 +7,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Str from "effect/String";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -39,15 +40,6 @@ export interface WatchSessionOptions {
     readonly script: string;
     readonly args: ReadonlyArray<string>;
   };
-}
-
-/**
- * The exit status of one child CLI run.
- *
- * @internal
- */
-interface RunOutcome {
-  readonly failed: boolean;
 }
 
 /**
@@ -85,31 +77,26 @@ const isWatchFlag = (token: string): boolean =>
  *
  * @internal
  */
-const runChildOnce: (
+const runChildOnce = Effect.fnUntraced(function* (
   session: WatchSessionOptions,
   plan: Watch.WatchRunPlan,
-) => Effect.Effect<RunOutcome, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> = (
-  session,
-  plan,
-) =>
-  Effect.gen(function* () {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const { executable, execArgv, script } = session.invocation;
-    const narrowFeatures = plan.full ? undefined : yield* narrowEnvValue(plan.features);
-    const env = {
-      [watchChildEnvName]: watchChildEnvValue,
-      [narrowEnvName]: narrowFeatures,
-    };
-    const exitCode = yield* spawner.exitCode(
-      ChildProcess.make(executable, [...execArgv, script, ...session.invocation.args], {
-        env,
-        extendEnv: true,
-        stdout: "inherit",
-        stderr: "inherit",
-      }),
-    );
-    return { failed: exitCode !== 0 };
-  });
+): Effect.fn.Return<void, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const { executable, execArgv, script } = session.invocation;
+  const narrowFeatures = plan.full ? undefined : yield* narrowEnvValue(plan.features);
+  const env = {
+    [watchChildEnvName]: watchChildEnvValue,
+    [narrowEnvName]: narrowFeatures,
+  };
+  yield* spawner.exitCode(
+    ChildProcess.make(executable, [...execArgv, script, ...session.invocation.args], {
+      env,
+      extendEnv: true,
+      stdout: "inherit",
+      stderr: "inherit",
+    }),
+  );
+});
 
 /**
  * Run the watch loop: execute the initial full run, then consume trigger
@@ -118,22 +105,18 @@ const runChildOnce: (
  *
  * @internal
  */
-export const watchLoop: (
+export const watchLoop = Effect.fnUntraced(function* (
   session: WatchSessionOptions,
   triggers: Queue.Dequeue<ReadonlyArray<Watch.WatchTrigger>>,
-) => Effect.Effect<void, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> = (
-  session,
-  triggers,
-) =>
-  Effect.gen(function* () {
-    yield* runChildOnce(session, { full: true, features: session.cli.features });
-    yield* Watch.rerunLoop(triggers, Schedule.spaced("100 millis"), (batch) =>
-      Effect.gen(function* () {
-        const plan = Watch.planForTriggers(batch, session.cli.features);
-        yield* runChildOnce(session, plan);
-      }),
-    );
-  });
+): Effect.fn.Return<void, WatchSessionError, ChildProcessSpawner.ChildProcessSpawner> {
+  yield* runChildOnce(session, { full: true, features: session.cli.features });
+  yield* Watch.rerunLoop(triggers, Schedule.spaced("100 millis"), (batch) =>
+    Effect.gen(function* () {
+      const plan = Watch.planForTriggers(batch, session.cli.features);
+      yield* runChildOnce(session, plan);
+    }),
+  );
+});
 
 /**
  * Run a full watch session: initial run, then rerun on file changes until the
@@ -143,25 +126,24 @@ export const watchLoop: (
  *
  * @internal
  */
-export const watchSession: (
+export const watchSession = Effect.fnUntraced(function* (
   session: WatchSessionOptions,
-) => Effect.Effect<
+): Effect.fn.Return<
   void,
   WatchSessionError,
-  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
-> = (session) =>
-  Effect.gen(function* () {
-    const paths = Watch.watchPaths({ features: session.cli.features, steps: session.cli.steps });
-    const events = yield* Watch.mergedWatchEvents(paths);
-    const triggers = yield* Watch.makeTriggerQueue;
-    // The pump and the rerun loop are sibling fibers on the session scope:
-    // all([pump.await, loop]) runs them concurrently and joins when the loop
-    // ends, so a watcher teardown cannot outlive a rerun in flight.
-    yield* Effect.all(
-      [
-        Effect.flatMap(Effect.forkScoped(Watch.pumpTriggerQueue(events, triggers)), Fiber.join),
-        watchLoop(session, triggers),
-      ],
-      { concurrency: 2 },
-    ).pipe(Effect.asVoid);
-  }).pipe(Effect.scoped);
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path | Scope.Scope
+> {
+  const paths = Watch.watchPaths({ features: session.cli.features, steps: session.cli.steps });
+  const events = yield* Watch.mergedWatchEvents(paths);
+  const triggers = yield* Watch.makeTriggerQueue;
+  // The pump and the rerun loop are sibling fibers on the session scope:
+  // all([pump.await, loop]) runs them concurrently and joins when the loop
+  // ends, so a watcher teardown cannot outlive a rerun in flight.
+  yield* Effect.all(
+    [
+      Effect.flatMap(Effect.forkScoped(Watch.pumpTriggerQueue(events, triggers)), Fiber.join),
+      watchLoop(session, triggers),
+    ],
+    { concurrency: 2 },
+  ).pipe(Effect.asVoid);
+}, Effect.scoped);
